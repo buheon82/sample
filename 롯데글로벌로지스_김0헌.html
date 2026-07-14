@@ -94,6 +94,11 @@
   }
   .box-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
   .swatch { width: 14px; height: 14px; border-radius: 3px; display: inline-block; margin-right: 6px; vertical-align: middle; }
+  .max-fill-row { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+  .max-fill-row input[type="checkbox"] { width: auto; }
+  .max-fill-row label { font-size: 12px; color: var(--text); cursor: pointer; }
+  .b-qty:disabled { opacity: 0.45; cursor: not-allowed; }
+  .max-badge { color: var(--accent-2); font-size: 11px; margin-left: 4px; }
   .stats { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
   .stat-row { display: flex; justify-content: space-between; padding: 6px 10px; background: var(--panel-2); border-radius: 6px; }
   .stat-row b { color: var(--accent-2); }
@@ -197,9 +202,19 @@ function addBoxRow(name, l, w, h, qty) {
       <div class="field"><label>W</label><input type="number" class="b-w" value="${w || 40}" min="1" /></div>
       <div class="field"><label>H</label><input type="number" class="b-h" value="${h || 40}" min="1" /></div>
     </div>
+    <div class="max-fill-row">
+      <input type="checkbox" class="b-maxfill" id="maxfill-${id}" onchange="toggleMaxFill(${id})" />
+      <label for="maxfill-${id}">수량 대신 이 컨테이너에 최대 몇 개 들어가는지 계산</label>
+    </div>
   `;
   div.dataset.color = color;
   document.getElementById("boxList").appendChild(div);
+}
+
+function toggleMaxFill(id) {
+  const card = document.getElementById("box-" + id);
+  const checked = card.querySelector(".b-maxfill").checked;
+  card.querySelector(".b-qty").disabled = checked;
 }
 
 document.getElementById("contPreset").addEventListener("change", (e) => {
@@ -216,17 +231,8 @@ addBoxRow("중형박스B", 60, 40, 40, 40);
 addBoxRow("소형박스C", 30, 20, 20, 80);
 
 // ---------- 3D Bin Packing (guillotine / free-space split heuristic) ----------
+// boxTypes[i].mode: "fixed" (place exactly qty, report unplaced) or "max" (fill container with as many as possible, qty ignored)
 function packContainer(container, boxTypes) {
-  // expand box types into individual units
-  let units = [];
-  boxTypes.forEach((bt, typeIdx) => {
-    for (let i = 0; i < bt.qty; i++) {
-      units.push({ typeIdx, l: bt.l, w: bt.w, h: bt.h, vol: bt.l * bt.w * bt.h });
-    }
-  });
-  // largest volume first
-  units.sort((a, b) => b.vol - a.vol);
-
   let freeSpaces = [{ x: 0, y: 0, z: 0, l: container.l, w: container.w, h: container.h }];
   const placed = [];
   const unplaced = [];
@@ -235,14 +241,15 @@ function packContainer(container, boxTypes) {
     [l, w, h], [w, l, h], [l, h, w], [h, l, w], [w, h, l], [h, w, l]
   ]);
 
-  for (const unit of units) {
+  // tries to place a single unit of the given dims; returns true if placed
+  function tryPlaceOne(typeIdx, l, w, h) {
     let bestSpaceIdx = -1;
     let bestDims = null;
     let bestScore = Infinity;
 
     for (let si = 0; si < freeSpaces.length; si++) {
       const s = freeSpaces[si];
-      for (const [dl, dw, dh] of orientations(unit.l, unit.w, unit.h)) {
+      for (const [dl, dw, dh] of orientations(l, w, h)) {
         if (dl <= s.l && dw <= s.w && dh <= s.h) {
           // prefer space closest in volume (least waste), then lowest z then lowest y then lowest x
           const waste = s.l * s.w * s.h - dl * dw * dh;
@@ -256,18 +263,11 @@ function packContainer(container, boxTypes) {
       }
     }
 
-    if (bestSpaceIdx === -1) {
-      unplaced.push(unit);
-      continue;
-    }
+    if (bestSpaceIdx === -1) return false;
 
     const s = freeSpaces[bestSpaceIdx];
     const [dl, dw, dh] = bestDims;
-    placed.push({
-      typeIdx: unit.typeIdx,
-      x: s.x, y: s.y, z: s.z,
-      l: dl, w: dw, h: dh
-    });
+    placed.push({ typeIdx, x: s.x, y: s.y, z: s.z, l: dl, w: dw, h: dh });
 
     // remove used space, split remaining into up to 3 guillotine sub-spaces
     freeSpaces.splice(bestSpaceIdx, 1);
@@ -278,9 +278,33 @@ function packContainer(container, boxTypes) {
     ].filter(ns => ns.l > 0 && ns.w > 0 && ns.h > 0);
 
     freeSpaces.push(...newSpaces);
+    return true;
   }
 
-  return { placed, unplaced, totalUnits: units.length };
+  // 1) place all fixed-quantity boxes first (largest volume first for tighter packing)
+  let fixedUnits = [];
+  boxTypes.forEach((bt, typeIdx) => {
+    if (bt.mode === "max") return;
+    for (let i = 0; i < bt.qty; i++) {
+      fixedUnits.push({ typeIdx, l: bt.l, w: bt.w, h: bt.h, vol: bt.l * bt.w * bt.h });
+    }
+  });
+  fixedUnits.sort((a, b) => b.vol - a.vol);
+  fixedUnits.forEach(u => {
+    if (!tryPlaceOne(u.typeIdx, u.l, u.w, u.h)) unplaced.push(u);
+  });
+
+  // 2) for each "max fill" box type (largest volume type first), keep filling remaining space
+  const maxTypes = boxTypes
+    .map((bt, typeIdx) => ({ ...bt, typeIdx }))
+    .filter(bt => bt.mode === "max")
+    .sort((a, b) => (b.l * b.w * b.h) - (a.l * a.w * a.h));
+
+  maxTypes.forEach(bt => {
+    while (tryPlaceOne(bt.typeIdx, bt.l, bt.w, bt.h)) { /* keep going until it no longer fits */ }
+  });
+
+  return { placed, unplaced, totalFixedUnits: fixedUnits.length };
 }
 
 // ---------- Three.js scene ----------
@@ -379,12 +403,14 @@ function runPacking() {
 
   const boxTypes = [];
   document.querySelectorAll(".box-card").forEach(card => {
+    const isMax = card.querySelector(".b-maxfill").checked;
     boxTypes.push({
       name: card.querySelector(".b-name").value,
       l: Number(card.querySelector(".b-l").value),
       w: Number(card.querySelector(".b-w").value),
       h: Number(card.querySelector(".b-h").value),
       qty: Number(card.querySelector(".b-qty").value),
+      mode: isMax ? "max" : "fixed",
       color: card.dataset.color
     });
   });
@@ -411,14 +437,16 @@ function updateStats(result, boxTypes, contL, contW, contH) {
   const utilization = ((usedVol / containerVol) * 100).toFixed(1);
   const placedCount = result.placed.length;
   const unplacedCount = result.unplaced.length;
+  const hasMaxFill = boxTypes.some(bt => bt.mode === "max");
 
   const panel = document.getElementById("statsPanel");
   panel.innerHTML = `
-    <div class="stat-row"><span>총 요청 박스</span><b>${result.totalUnits} 개</b></div>
-    <div class="stat-row"><span>적재 완료</span><b>${placedCount} 개</b></div>
-    <div class="stat-row ${unplacedCount > 0 ? 'warn' : ''}"><span>미적재</span><b>${unplacedCount} 개</b></div>
+    <div class="stat-row"><span>고정 수량 요청</span><b>${result.totalFixedUnits} 개</b></div>
+    <div class="stat-row"><span>적재 완료(총)</span><b>${placedCount} 개</b></div>
+    <div class="stat-row ${unplacedCount > 0 ? 'warn' : ''}"><span>고정 수량 중 미적재</span><b>${unplacedCount} 개</b></div>
     <div class="stat-row"><span>부피 적재율</span><b>${utilization}%</b></div>
     <div class="stat-row"><span>컨테이너 부피</span><b>${(containerVol / 1e6).toFixed(2)} m³</b></div>
+    ${hasMaxFill ? '<div class="stat-row"><span>※ "최대로 채우기" 박스는</span><b>범례에서 확인</b></div>' : ''}
   `;
 }
 
@@ -426,12 +454,18 @@ function updateLegend(boxTypes, result) {
   const counts = {};
   result.placed.forEach(p => { counts[p.typeIdx] = (counts[p.typeIdx] || 0) + 1; });
   const legend = document.getElementById("legend");
-  legend.innerHTML = boxTypes.map((bt, i) => `
+  legend.innerHTML = boxTypes.map((bt, i) => {
+    const count = counts[i] || 0;
+    const qtyText = bt.mode === "max"
+      ? `${count}개 적재 가능<span class="max-badge">(최대로 채우기)</span>`
+      : `${count} / ${bt.qty} 적재`;
+    return `
     <div class="legend-item">
       <span class="swatch" style="background:${bt.color}"></span>
-      ${bt.name} — ${counts[i] || 0} / ${bt.qty} 적재 (${bt.l}×${bt.w}×${bt.h}cm)
+      ${bt.name} — ${qtyText} (${bt.l}×${bt.w}×${bt.h}cm)
     </div>
-  `).join("");
+  `;
+  }).join("");
 }
 
 initScene();
